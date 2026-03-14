@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project implements a CLI agent (`agent.py`) that connects to an LLM and answers questions. The agent forms the foundation for subsequent tasks where tools and domain knowledge will be added.
+This project implements a documentation agent (`agent.py`) that can read project documentation and answer questions with source references. The agent has tools (`read_file`, `list_files`) and an agentic loop that allows multi-step reasoning.
 
 ## LLM Provider
 
@@ -15,8 +15,8 @@ This project implements a CLI agent (`agent.py`) that connects to an LLM and ans
 - 1000 free requests per day — sufficient for development and testing.
 - Works from Russia without restrictions.
 - No credit card required.
-- OpenAI-compatible API — easy integration.
-- Strong tool-calling capabilities for future tasks.
+- OpenAI-compatible API with function calling support.
+- Strong tool-calling capabilities.
 
 ## Architecture
 
@@ -25,11 +25,20 @@ This project implements a CLI agent (`agent.py`) that connects to an LLM and ans
 │  Command Line   │────▶│   agent.py   │────▶│   LLM API       │
 │  "Question"     │     │  (CLI tool)  │     │  (Qwen Code)    │
 └─────────────────┘     └──────────────┘     └─────────────────┘
+                               │                      │
+                               │◀──── tool calls ─────│
+                               ▼                      │
+                        ┌──────────────┐              │
+                        │  Tools:      │──────────────┘
+                        │  - read_file │
+                        │  - list_files│
+                        └──────────────┘
                                │
                                ▼
                         ┌──────────────┐
                         │  JSON Output │
                         │  {answer,    │
+                        │   source,    │
                         │   tool_calls}│
                         └──────────────┘
 ```
@@ -38,25 +47,130 @@ This project implements a CLI agent (`agent.py`) that connects to an LLM and ans
 
 | Component | Description |
 |-----------|-------------|
-| `agent.py` | Main CLI entry point. Parses arguments, loads config, calls LLM, outputs JSON. |
+| `agent.py` | Main CLI entry point. Implements agentic loop. |
 | `AgentSettings` | Pydantic settings class. Loads from `.env.agent.secret`. |
+| `read_file()` | Tool: reads a file from the project. |
+| `list_files()` | Tool: lists files in a directory. |
+| `validate_path()` | Security: prevents directory traversal. |
 | `call_llm()` | Async function that makes HTTP POST to LLM API. |
-| `create_response()` | Formats the answer into the required JSON structure. |
+| `run_agent_loop()` | Agentic loop: call LLM → execute tools → repeat. |
+| `create_response()` | Formats the answer into JSON structure. |
 
-### Data Flow
+## Tools
 
-1. User runs: `uv run agent.py "What is REST?"`
-2. `agent.py` reads `.env.agent.secret` for API credentials.
-3. Agent sends POST request to `{LLM_API_BASE}/chat/completions`.
-4. LLM returns response with answer.
-5. Agent outputs JSON to stdout: `{"answer": "...", "tool_calls": []}`.
-6. All logs go to stderr.
+### `read_file`
+
+Read a file from the project repository.
+
+**Parameters:**
+- `path` (string, required) — relative path from project root.
+
+**Returns:** File contents as string, or error message.
+
+**Schema:**
+```json
+{
+  "name": "read_file",
+  "description": "Read a file from the project repository",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Relative path from project root"
+      }
+    },
+    "required": ["path"]
+  }
+}
+```
+
+### `list_files`
+
+List files and directories at a given path.
+
+**Parameters:**
+- `path` (string, required) — relative directory path from project root.
+
+**Returns:** Newline-separated listing.
+
+**Schema:**
+```json
+{
+  "name": "list_files",
+  "description": "List files and directories at a given path",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Relative directory path from project root"
+      }
+    },
+    "required": ["path"]
+  }
+}
+```
+
+## Security
+
+### Path Validation
+
+The `validate_path()` function ensures tools cannot access files outside the project:
+
+1. Rejects paths containing `..` (directory traversal).
+2. Resolves path relative to project root.
+3. Verifies resolved path is within project root.
+
+## Agentic Loop
+
+The agent follows this loop:
+
+```
+1. Send user question + tool schemas to LLM
+2. Receive response:
+   - If tool_calls present:
+     a. Execute each tool
+     b. Add results as "tool" role messages
+     c. Go to step 1
+   - If no tool_calls:
+     a. Extract answer and source
+     b. Output JSON and exit
+3. Maximum 10 iterations
+```
+
+### Message Format
+
+```python
+messages = [
+    {"role": "system", "content": SYSTEM_PROMPT},
+    {"role": "user", "content": question},
+    # After tool calls:
+    # {"role": "assistant", "content": None, "tool_calls": [...]},
+    # {"role": "tool", "content": result, "tool_call_id": "..."},
+]
+```
+
+## System Prompt
+
+```
+You are a documentation assistant for a software engineering project.
+You have access to tools to read files and list directories in the project repository.
+
+When answering questions:
+1. Use list_files to discover relevant files in the wiki/ directory.
+2. Use read_file to read the contents of files.
+3. Provide concise answers with source references (file path + section anchor).
+4. Never access files outside the project directory.
+
+Always include the source field in your final answer. The source should be in format: wiki/filename.md#section-anchor
+
+If you don't find the answer in the documentation, say so honestly.
+```
 
 ## Configuration
 
 ### Environment File: `.env.agent.secret`
-
-Copy from `.env.agent.example`:
 
 ```bash
 cp .env.agent.example .env.agent.secret
@@ -65,13 +179,8 @@ cp .env.agent.example .env.agent.secret
 Edit `.env.agent.secret`:
 
 ```ini
-# Your LLM provider API key
 LLM_API_KEY=your-llm-api-key-here
-
-# API base URL (OpenAI-compatible endpoint)
 LLM_API_BASE=http://<your-vm-ip>:<qwen-api-port>/v1
-
-# Model name
 LLM_MODEL=qwen3-coder-plus
 ```
 
@@ -82,13 +191,20 @@ LLM_MODEL=qwen3-coder-plus
 ### Basic Usage
 
 ```bash
-uv run agent.py "What does REST stand for?"
+uv run agent.py "How do you resolve a merge conflict?"
 ```
 
 ### Expected Output
 
 ```json
-{"answer": "Representational State Transfer.", "tool_calls": []}
+{
+  "answer": "Edit the conflicting file, choose which changes to keep, then stage and commit.",
+  "source": "wiki/git-workflow.md#resolving-merge-conflicts",
+  "tool_calls": [
+    {"tool": "list_files", "args": {"path": "wiki"}, "result": "git-workflow.md\n..."},
+    {"tool": "read_file", "args": {"path": "wiki/git-workflow.md"}, "result": "..."}
+  ]
+}
 ```
 
 ### Exit Codes
@@ -106,29 +222,55 @@ All dependencies are already in `pyproject.toml`:
 |---------|---------|
 | `httpx` | Async HTTP client for API calls. |
 | `pydantic-settings` | Environment variable loading. |
+| `pydantic` | Data validation. |
 
 No new dependencies required.
 
 ## Testing
 
-Run unit tests:
+Run tests:
 
 ```bash
-uv run pytest backend/tests/unit/test_agent_task1.py -v
+uv run pytest tests/test_agent_task2.py -v
 ```
 
-The test:
+### Test Cases
 
-1. Runs `agent.py` as a subprocess.
-2. Parses stdout as JSON.
-3. Asserts `answer` and `tool_calls` fields exist.
+| Test | Question | Expected |
+|------|----------|----------|
+| Merge conflict | "How do you resolve a merge conflict?" | `read_file` in tool_calls, `wiki/git-workflow.md` in source |
+| List files | "What files are in the wiki?" | `list_files` in tool_calls |
 
-## Future Extensions (Tasks 2–3)
+## Data Flow
 
-- **Tools:** Add `read_file`, `query_api`, and other tools.
-- **Agentic Loop:** Enable multi-step reasoning with tool calls.
-- **Domain Knowledge:** Load wiki documentation for context.
-- **Enhanced System Prompt:** Add instructions for tool usage.
+```
+User Question
+      │
+      ▼
+┌─────────────────────────────────┐
+│ 1. Build messages array         │
+│    - system prompt              │
+│    - user question              │
+└─────────────────────────────────┘
+      │
+      ▼
+┌─────────────────────────────────┐
+│ 2. Call LLM with tools          │
+│    - POST /chat/completions     │
+│    - Include tool schemas       │
+└─────────────────────────────────┘
+      │
+      ▼
+┌─────────────────────────────────┐
+│ 3. Check response               │
+│    - tool_calls? → execute      │
+│    - no tool_calls? → answer    │
+└─────────────────────────────────┘
+      │
+      ├─── tool_calls ───▶ Execute tools ───▶ Add tool results to messages ───┐
+      │                                                                          │
+      └─── no tool_calls ───▶ Extract answer & source ───▶ Output JSON ───▶ Done
+```
 
 ## Troubleshooting
 
@@ -139,3 +281,12 @@ The test:
 | `HTTP error from LLM API: 404` | Check `LLM_API_BASE` URL is correct (should end with `/v1`). |
 | `Request error` | Verify network connectivity to the VM. |
 | `Request timed out` | LLM took >60 seconds. Try again or use a faster model. |
+| `Path traversal not allowed` | Agent blocked attempt to access files outside project. |
+| Max iterations reached | Agent made 10 tool calls without finding answer. |
+
+## Future Extensions (Task 3)
+
+- **More tools:** `query_api`, `search_code`, `run_command`.
+- **Domain knowledge:** Load wiki context into system prompt.
+- **Better source extraction:** Parse Markdown headers for anchors.
+- **Caching:** Cache file reads to reduce API calls.
