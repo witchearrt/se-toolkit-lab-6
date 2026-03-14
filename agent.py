@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Documentation Agent — Task 2
+System Agent — Task 3
 
-An agentic CLI that can read project documentation and answer questions with sources.
+An agentic CLI that can read documentation, query the backend API, and answer questions with sources.
 
 Usage:
     uv run agent.py "Your question here"
@@ -14,6 +14,8 @@ Output:
 
 import asyncio
 import json
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -35,6 +37,19 @@ class AgentSettings(BaseSettings):
     llm_api_key: str
     llm_api_base: str
     llm_model: str = "qwen3-coder-plus"
+
+
+class AgentConfig(BaseSettings):
+    """Load agent configuration from environment variables."""
+
+    model_config = ConfigDict(
+        env_file=".env.docker.secret",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    lms_api_key: str = ""
+    agent_api_base_url: str = "http://localhost:42002"
 
 
 # =============================================================================
@@ -85,7 +100,12 @@ def read_file(path: str) -> str:
         file_path = validate_path(path)
         if not file_path.is_file():
             return f"Error: Not a file: {path}"
-        return file_path.read_text(encoding="utf-8")
+        content = file_path.read_text(encoding="utf-8")
+        # Limit content size to avoid token limits, but try to keep more for large files
+        max_chars = 30000
+        if len(content) > max_chars:
+            content = content[:max_chars] + "\n... (truncated)"
+        return content
     except ValueError as e:
         return f"Error: {e}"
     except Exception as e:
@@ -119,6 +139,54 @@ def list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
+def query_api(method: str, path: str, body: str | None = None, config: AgentConfig | None = None) -> str:
+    """
+    Call the deployed backend API.
+
+    Args:
+        method: HTTP method (GET, POST, PUT, DELETE).
+        path: API path (e.g., /items/, /analytics/completion-rate).
+        body: Optional JSON request body for POST/PUT.
+        config: Agent configuration with API key and base URL.
+
+    Returns:
+        JSON string with status_code and body.
+    """
+    if config is None:
+        config = AgentConfig()
+
+    base_url = config.agent_api_base_url.rstrip("/")
+    url = f"{base_url}{path}"
+    headers = {}
+
+    if config.lms_api_key:
+        headers["Authorization"] = f"Bearer {config.lms_api_key}"
+
+    try:
+        if method.upper() == "GET":
+            response = httpx.get(url, headers=headers, timeout=30.0)
+        elif method.upper() == "POST":
+            json_body = json.loads(body) if body else None
+            response = httpx.post(url, headers=headers, json=json_body, timeout=30.0)
+        elif method.upper() == "PUT":
+            json_body = json.loads(body) if body else None
+            response = httpx.put(url, headers=headers, json=json_body, timeout=30.0)
+        elif method.upper() == "DELETE":
+            response = httpx.delete(url, headers=headers, timeout=30.0)
+        else:
+            return json.dumps({"status_code": 400, "error": f"Unknown method: {method}"})
+
+        result = {
+            "status_code": response.status_code,
+            "body": response.json() if response.content else None,
+        }
+        return json.dumps(result)
+    except httpx.RequestError as e:
+        return json.dumps({"status_code": 0, "error": str(e)})
+    except json.JSONDecodeError:
+        return json.dumps({"status_code": response.status_code, "body": response.text})
+
+
 # =============================================================================
 # Tool Schemas for LLM Function Calling
 # =============================================================================
@@ -128,13 +196,13 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from the project repository",
+            "description": "Read a file from the project repository. Use for documentation (wiki/) and source code.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md')",
+                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md', 'backend/app/main.py')",
                     }
                 },
                 "required": ["path"],
@@ -145,16 +213,41 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List files and directories at a given path",
+            "description": "List files and directories at a given path. Use to discover files in a directory.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative directory path from project root (e.g., 'wiki')",
+                        "description": "Relative directory path from project root (e.g., 'wiki', 'backend/app/routers')",
                     }
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Call the deployed backend API. Use for system facts (ports, frameworks, status codes) and data queries (item count, scores).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (GET, POST, PUT, DELETE)",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API path (e.g., '/items/', '/analytics/completion-rate')",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "JSON request body for POST/PUT (optional)",
+                    },
+                },
+                "required": ["method", "path"],
             },
         },
     },
@@ -163,6 +256,7 @@ TOOL_SCHEMAS = [
 TOOLS_MAP = {
     "read_file": read_file,
     "list_files": list_files,
+    "query_api": query_api,
 }
 
 
@@ -170,18 +264,37 @@ TOOLS_MAP = {
 # System Prompt
 # =============================================================================
 
-SYSTEM_PROMPT = """You are a documentation assistant for a software engineering project.
-You have access to tools to read files and list directories in the project repository.
+SYSTEM_PROMPT = """You are a documentation and system assistant for a software engineering project.
+You have access to tools to read files, list directories, and query the backend API.
 
-When answering questions:
-1. Use list_files to discover relevant files in the wiki/ directory.
-2. Use read_file to read the contents of files.
-3. Provide concise answers with source references (file path + section anchor).
-4. Never access files outside the project directory.
+Tool usage guidelines:
+1. Use list_files to discover relevant files in the wiki/, backend/, or other directories.
+2. Use read_file to read the contents of files (documentation, source code, configs).
+3. Use query_api to query the running backend API for system facts and data.
 
-Always include the source field in your final answer. The source should be in format: wiki/filename.md#section-anchor
+When to use query_api:
+- Questions about HTTP status codes, ports, frameworks
+- Questions about data in the database (item count, scores, learners)
+- Questions that require calling a live API endpoint
+- Questions about API behavior (errors, responses)
 
-If you don't find the answer in the documentation, say so honestly."""
+When to use read_file:
+- Questions about documentation in wiki/
+- Questions about source code structure
+- Questions about configuration files (docker-compose.yml, pyproject.toml, etc.)
+
+When to use list_files:
+- Discovering what files exist in a directory
+- Finding API routers, models, or modules
+
+Reading documentation effectively:
+- When looking for specific topics in wiki files, scan the table of contents first (lines near the top with # anchors).
+- If a file is large, the content may be truncated. Focus on finding the relevant section anchor (e.g., #protect-a-branch) and mention that the full details are in that section.
+- Always cite the specific section anchor when answering from documentation.
+
+Always include the source field when referencing documentation or source code.
+For API queries, mention the endpoint path in your answer.
+If you don't find the answer, say so honestly."""
 
 
 # =============================================================================
@@ -244,13 +357,15 @@ async def call_llm(
 async def run_agent_loop(
     question: str,
     settings: AgentSettings,
+    config: AgentConfig,
 ) -> tuple[str, str, list[dict[str, Any]]]:
     """
     Run the agentic loop: call LLM, execute tools, repeat until answer.
 
     Args:
         question: User's question.
-        settings: Agent configuration.
+        settings: LLM configuration.
+        config: Agent configuration (API key, base URL).
 
     Returns:
         Tuple of (answer, source, tool_calls_list).
@@ -261,6 +376,7 @@ async def run_agent_loop(
     ]
 
     tool_calls_log: list[dict[str, Any]] = []
+    last_read_file: str | None = None
 
     for iteration in range(MAX_TOOL_CALLS):
         print(f"\n--- Iteration {iteration + 1} ---", file=sys.stderr)
@@ -281,8 +397,8 @@ async def run_agent_loop(
 
         if not tool_calls:
             # No tool calls - LLM provided final answer
-            answer = message.get("content", "")
-            source = extract_source(answer, tool_calls_log)
+            answer = message.get("content") or ""
+            source = extract_source(answer, tool_calls_log, last_read_file)
             print(f"\nFinal answer received. Source: {source}", file=sys.stderr)
             return answer, source, tool_calls_log
 
@@ -298,10 +414,16 @@ async def run_agent_loop(
             print(f"Executing tool: {tool_name}({args})", file=sys.stderr)
 
             # Execute the tool
-            if tool_name in TOOLS_MAP:
+            if tool_name == "query_api":
+                result = TOOLS_MAP[tool_name](config=config, **args)
+            elif tool_name in TOOLS_MAP:
                 result = TOOLS_MAP[tool_name](**args)
             else:
                 result = f"Error: Unknown tool '{tool_name}'"
+
+            # Track last read_file for source extraction
+            if tool_name == "read_file":
+                last_read_file = args.get("path", "")
 
             print(f"Tool result: {result[:200]}...", file=sys.stderr)
 
@@ -326,25 +448,28 @@ async def run_agent_loop(
     # Max iterations reached
     print("\nMax tool calls reached.", file=sys.stderr)
     answer = "I reached the maximum number of tool calls (10) without finding a complete answer."
-    source = extract_source("", tool_calls_log)
+    source = extract_source("", tool_calls_log, last_read_file)
     return answer, source, tool_calls_log
 
 
-def extract_source(answer: str, tool_calls_log: list[dict[str, Any]]) -> str:
+def extract_source(
+    answer: str,
+    tool_calls_log: list[dict[str, Any]],
+    last_read_file: str | None = None,
+) -> str:
     """
     Extract or generate the source reference.
 
     Args:
         answer: The LLM's answer text.
         tool_calls_log: List of tool calls made.
+        last_read_file: Last file read via read_file.
 
     Returns:
         Source reference string (e.g., "wiki/git-workflow.md#section").
     """
-    # Try to find source in the answer text (pattern: wiki/...md#...)
-    import re
-
-    pattern = r"(wiki/[\w-]+\.md#[\w-]+)"
+    # Try to find source in the answer text (pattern: wiki/...md#... or backend/...py)
+    pattern = r"(wiki/[\w-]+\.md#[\w-]+|backend/[\w_/]+\.py)"
     match = re.search(pattern, answer)
     if match:
         return match.group(1)
@@ -353,14 +478,18 @@ def extract_source(answer: str, tool_calls_log: list[dict[str, Any]]) -> str:
     for call in reversed(tool_calls_log):
         if call["tool"] == "read_file":
             path = call["args"].get("path", "")
-            if path.startswith("wiki/"):
+            if path.endswith(".md") or path.endswith(".py") or path.endswith(".yml") or path.endswith(".toml"):
                 # Try to find section from answer
                 section_match = re.search(r"#([\w-]+)", answer)
                 if section_match:
                     return f"{path}#{section_match.group(1)}"
                 return path
 
-    return "wiki/"
+    # Fallback: use last_read_file
+    if last_read_file:
+        return last_read_file
+
+    return ""
 
 
 # =============================================================================
@@ -408,7 +537,7 @@ async def main() -> int:
     try:
         settings = AgentSettings()
     except Exception as e:
-        print(f"Error loading settings: {e}", file=sys.stderr)
+        print(f"Error loading LLM settings: {e}", file=sys.stderr)
         print(
             "Make sure .env.agent.secret exists with LLM_API_KEY, LLM_API_BASE, LLM_MODEL",
             file=sys.stderr,
@@ -416,7 +545,13 @@ async def main() -> int:
         return 1
 
     try:
-        answer, source, tool_calls_log = await run_agent_loop(question, settings)
+        config = AgentConfig()
+    except Exception as e:
+        print(f"Warning: Could not load agent config: {e}", file=sys.stderr)
+        config = AgentConfig()
+
+    try:
+        answer, source, tool_calls_log = await run_agent_loop(question, settings, config)
     except httpx.HTTPStatusError as e:
         print(f"HTTP error from LLM API: {e.response.status_code}", file=sys.stderr)
         print(f"Response: {e.response.text}", file=sys.stderr)
