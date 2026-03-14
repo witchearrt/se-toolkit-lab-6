@@ -155,6 +155,24 @@ For API queries, mention the endpoint path in your answer.
 - Улучшить system prompt для более точного поиска секций.
 - Для вопросов с query_api нужен запущенный backend.
 
+## Deployment to VM
+
+The autochecker runs the agent on the VM at `10.93.25.169`. Files deployed:
+
+```bash
+scp agent.py root@10.93.25.169:/root/se-toolkit-lab-6/
+scp -r tests plans AGENT.md root@10.93.25.169:/root/se-toolkit-lab-6/
+scp .env.agent.secret .env.docker.secret root@10.93.25.169:/root/se-toolkit-lab-6/
+```
+
+**Verification:**
+```bash
+ssh root@10.93.25.169 "cd /root/se-toolkit-lab-6 && /root/.local/bin/uv run agent.py 'What is 2 + 2?'"
+# Output: {"answer": "2 + 2 = 4.", "source": "", "tool_calls": []}
+```
+
+**Note:** The `uv` binary is at `/root/.local/bin/uv` on the VM.
+
 ## Тесты
 
 ### Test 1: Framework question
